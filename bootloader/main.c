@@ -36,19 +36,20 @@
 #include "frontend/fe_info.h"
 
 // Secondary SD environment (sdroot=<folder>): swaps every item found inside
-// <folder>/ with its counterpart in the SD root, except the items below.
-// The hekate install (bootloader) and the emuMMC (selected via emupath) are
-// never swapped. The marker stores the folder plus the exact list of swapped
-// items so the next boot can revert precisely, even items that only exist in
-// the secondary environment.
+// <folder>/ with its counterpart in the SD root, making <folder> the logical
+// SD root for everything that boots afterwards, including the emuMMC. Only
+// the hekate install (bootloader) and the bootdat/ini payload loaders stay
+// on the physical root. The marker stores the folder plus the exact list of
+// swapped items so the next boot can revert precisely, even items that only
+// exist in the secondary environment.
 #define SDROOT_MARKER "bootloader/sdroot.txt"
 #define SDROOT_BUF_SZ 0x1000
 
 static bool _sdroot_excluded(const char *name)
 {
-	// Shared across environments: hekate install (bootloader), the emuMMC
-	// (selected via emupath), the hekate payload, and bootdat/boot.ini loaders.
-	static const char ex[] = "bootloader\0emuMMC\0payload.bin\0boot.ini\0boot.dat";
+	// Multi pack infrastructure: hekate install (bootloader), the hekate
+	// payload, and bootdat/boot.ini loaders. Everything else belongs to a pack.
+	static const char ex[] = "bootloader\0payload.bin\0boot.ini\0boot.dat";
 	for (const char *e = ex; *e; e += strlen(e) + 1)
 		if (!strcmp(name, e))
 			return true;
@@ -123,6 +124,10 @@ static void _sdroot_restore()
 
 static void _sdroot_activate(const char *path)
 {
+	// Undo any active swap first; activating twice without a restore in
+	// between would list the already-swapped folder and lose the backups.
+	_sdroot_restore();
+
 	FILINFO fi;
 	DIR dir;
 	if (f_opendir(&dir, path) != FR_OK)
@@ -205,6 +210,42 @@ static void _apply_system_setting(const char *value)
 
 	f_close(&src_fp);
 	f_close(&dst_fp);
+}
+
+// Process a boot entry's environment keys, identically across every launch
+// path (menu, ini list, autoboot, boot-from-id), including payload and L4T
+// entries. sdroot runs first so every later key and file access resolves
+// inside the pack root.
+static void _process_entry_env(ini_sec_t *sec, char **logopath, char **emummc_path, u32 *boot_wait)
+{
+	bool swapped = false;
+	LIST_FOREACH_ENTRY(ini_kv_t, kv, &sec->kvs, link)
+	{
+		if (!strcmp("sdroot", kv->key))
+		{
+			_sdroot_activate(kv->val);
+			swapped = true;
+		}
+	}
+
+	// The emuMMC config was loaded from the main environment at boot;
+	// re-read it so the pack's own emuMMC (now at the root) is used.
+	if (swapped)
+		emummc_load_cfg();
+
+	LIST_FOREACH_ENTRY(ini_kv_t, kv, &sec->kvs, link)
+	{
+		if (!strcmp("emupath", kv->key))
+			*emummc_path = kv->val;
+		else if (!strcmp("emummc_force_disable", kv->key))
+			h_cfg.emummc_force_disable = atoi(kv->val);
+		else if (!strcmp("system_settings", kv->key))
+			_apply_system_setting(kv->val);
+		else if (logopath && !strcmp("logopath", kv->key))
+			*logopath = kv->val;
+		else if (boot_wait && !strcmp("bootwait", kv->key))
+			*boot_wait = atoi(kv->val);
+	}
 }
 
 hekate_config h_cfg;
@@ -530,21 +571,11 @@ static void _launch_ini_list()
 
 		special_path = ini_check_special_section(cfg_sec);
 
-		if (cfg_sec && !special_path)
+		if (cfg_sec)
 		{
-			LIST_FOREACH_ENTRY(ini_kv_t, kv, &cfg_sec->kvs, link)
-			{
-				if (!strcmp("emummc_force_disable", kv->key))
-					h_cfg.emummc_force_disable = atoi(kv->val);
-				else if (!strcmp("emupath", kv->key))
-					emummc_path = kv->val;
-				else if (!strcmp("system_settings", kv->key))
-					_apply_system_setting(kv->val);
-				else if (!strcmp("sdroot", kv->key))
-					_sdroot_activate(kv->val);
-			}
+			_process_entry_env(cfg_sec, NULL, &emummc_path, NULL);
 
-			if (emummc_path && !emummc_set_path(emummc_path))
+			if (!special_path && emummc_path && !emummc_set_path(emummc_path))
 			{
 				EPRINTF("emupath invalido!");
 				goto wrong_emupath;
@@ -679,21 +710,11 @@ static void _launch_config()
 
 	special_path = ini_check_special_section(cfg_sec);
 
-	if (cfg_sec && !special_path)
+	if (cfg_sec)
 	{
-		LIST_FOREACH_ENTRY(ini_kv_t, kv, &cfg_sec->kvs, link)
-		{
-			if (!strcmp("emummc_force_disable", kv->key))
-				h_cfg.emummc_force_disable = atoi(kv->val);
-			if (!strcmp("emupath", kv->key))
-				emummc_path = kv->val;
-			if (!strcmp("system_settings", kv->key))
-				_apply_system_setting(kv->val);
-			if (!strcmp("sdroot", kv->key))
-				_sdroot_activate(kv->val);
-		}
+		_process_entry_env(cfg_sec, NULL, &emummc_path, NULL);
 
-		if (emummc_path && !emummc_set_path(emummc_path))
+		if (!special_path && emummc_path && !emummc_set_path(emummc_path))
 		{
 			EPRINTF("emupath invalido!");
 			goto wrong_emupath;
@@ -840,32 +861,20 @@ void launch_nyx()
 
 static ini_sec_t *_get_ini_sec_from_id(ini_sec_t *ini_sec, char **bootlogoCustomEntry, char **emummc_path)
 {
-	ini_sec_t *cfg_sec = NULL;
-
 	LIST_FOREACH_ENTRY(ini_kv_t, kv, &ini_sec->kvs, link)
 	{
 		if (!strcmp("id", kv->key))
 		{
 			if (b_cfg.id[0] && kv->val[0] && !strcmp(b_cfg.id, kv->val))
-				cfg_sec = ini_sec;
-			else
-				break;
+			{
+				_process_entry_env(ini_sec, bootlogoCustomEntry, emummc_path, NULL);
+				return ini_sec;
+			}
+			break;
 		}
-		if (!strcmp("emupath", kv->key))
-			*emummc_path = kv->val;
-		else if (!strcmp("logopath", kv->key))
-			*bootlogoCustomEntry = kv->val;
-		else if (!strcmp("emummc_force_disable", kv->key))
-			h_cfg.emummc_force_disable = atoi(kv->val);
-	}
-	if (!cfg_sec)
-	{
-		*emummc_path               = NULL;
-		*bootlogoCustomEntry       = NULL;
-		h_cfg.emummc_force_disable = false;
 	}
 
-	return cfg_sec;
+	return NULL;
 }
 
 static void _bootloader_corruption_protect()
@@ -928,11 +937,12 @@ static void _auto_launch()
 	LIST_INIT(ini_sections);
 	LIST_INIT(ini_list_sections);
 
+	// Restore main environment if a secondary SD root was active on the
+	// previous boot. Must run before emuMMC config is read from the root.
+	_sdroot_restore();
+
 	// Load emuMMC configuration.
 	emummc_load_cfg();
-
-	// Restore main environment if a secondary SD root was active on the previous boot.
-	_sdroot_restore();
 
 	// Parse hekate main configuration.
 	if (ini_parse(&ini_sections, "bootloader/hekate_ipl.ini", false))
@@ -992,21 +1002,7 @@ static void _auto_launch()
 			else if (h_cfg.autoboot == boot_entry_id && config_entry_found)
 			{
 				cfg_sec = ini_sec;
-				LIST_FOREACH_ENTRY(ini_kv_t, kv, &cfg_sec->kvs, link)
-				{
-					if (!strcmp("logopath", kv->key))
-						bootlogoCustomEntry = kv->val;
-					else if (!strcmp("emupath", kv->key))
-						emummc_path = kv->val;
-					else if (!strcmp("emummc_force_disable", kv->key))
-						h_cfg.emummc_force_disable = atoi(kv->val);
-					else if (!strcmp("bootwait", kv->key))
-						boot_wait = atoi(kv->val);
-					else if (!strcmp("system_settings", kv->key))
-						_apply_system_setting(kv->val);
-					else if (!strcmp("sdroot", kv->key))
-						_sdroot_activate(kv->val);
-				}
+				_process_entry_env(cfg_sec, &bootlogoCustomEntry, &emummc_path, &boot_wait);
 			}
 			if (cfg_sec)
 				break;
@@ -1043,21 +1039,7 @@ static void _auto_launch()
 			{
 				h_cfg.emummc_force_disable = false;
 				cfg_sec = ini_sec_list;
-				LIST_FOREACH_ENTRY(ini_kv_t, kv, &cfg_sec->kvs, link)
-				{
-					if (!strcmp("logopath", kv->key))
-						bootlogoCustomEntry = kv->val;
-					else if (!strcmp("emupath", kv->key))
-						emummc_path = kv->val;
-					else if (!strcmp("emummc_force_disable", kv->key))
-						h_cfg.emummc_force_disable = atoi(kv->val);
-					else if (!strcmp("bootwait", kv->key))
-						boot_wait = atoi(kv->val);
-					else if (!strcmp("system_settings", kv->key))
-						_apply_system_setting(kv->val);
-					else if (!strcmp("sdroot", kv->key))
-						_sdroot_activate(kv->val);
-				}
+				_process_entry_env(cfg_sec, &bootlogoCustomEntry, &emummc_path, &boot_wait);
 			}
 			if (cfg_sec)
 				break;
