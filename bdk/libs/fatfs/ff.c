@@ -5358,7 +5358,9 @@ FRESULT f_rename (
 								res = move_window(fs, dw);
 								dir = fs->win + SZDIRE * 1;	/* Ptr to .. entry */
 								if (res == FR_OK && dir[1] == '.') {
-									st_clust(fs, dir, djn.obj.sclust);
+									/* FAT32: root-level dirs need .. cluster = 0, not the actual root cluster */
+									u32 pc = (djn.obj.sclust == fs->dirbase) ? 0 : djn.obj.sclust;
+									st_clust(fs, dir, pc);
 									fs->wflag = 1;
 								}
 							}
